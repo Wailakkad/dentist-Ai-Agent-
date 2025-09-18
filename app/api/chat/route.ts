@@ -14,6 +14,26 @@ interface BookingState {
   isComplete: boolean;
 }
 
+interface ChatMessage {
+  role: string;
+  content: string;
+}
+
+interface OpenRouterResponse {
+  choices?: Array<{
+    message?: {
+      content?: string;
+    };
+  }>;
+}
+
+interface OpenRouterRequestBody {
+  model: string;
+  messages: ChatMessage[];
+  max_tokens: number;
+  temperature: number;
+}
+
 // Per-session rate limiting
 interface RateLimitSession {
   lastApiCall: number;
@@ -36,7 +56,7 @@ setInterval(() => {
 }, SESSION_CLEANUP_INTERVAL);
 
 // Generate or extract session ID from request
-function getSessionId(messages: any[]): string {
+function getSessionId(messages: ChatMessage[]): string {
   // Try to extract a session ID from the first message or generate one based on conversation content
   if (messages.length > 0) {
     const firstMessage = messages[0].content;
@@ -84,7 +104,7 @@ function checkRateLimit(sessionId: string): { canProceed: boolean; delay: number
 }
 
 // Retry function with per-session exponential backoff
-async function callOpenRouterWithRetry(requestBody: any, sessionId: string, maxRetries = 3): Promise<any> {
+async function callOpenRouterWithRetry(requestBody: OpenRouterRequestBody, sessionId: string, maxRetries = 3): Promise<OpenRouterResponse> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       // Per-session rate limiting check
@@ -116,7 +136,7 @@ async function callOpenRouterWithRetry(requestBody: any, sessionId: string, maxR
 
       if (response.ok) {
         console.log(`✅ Session ${sessionId}: OpenRouter API call successful`);
-        return await response.json();
+        return await response.json() as OpenRouterResponse;
       }
 
       if (response.status === 429) { // Too Many Requests
@@ -134,7 +154,8 @@ async function callOpenRouterWithRetry(requestBody: any, sessionId: string, maxR
       throw new Error(`OpenRouter API error: ${response.status} ${response.statusText}`);
       
     } catch (error) {
-      console.error(`❌ Session ${sessionId}: OpenRouter API attempt ${attempt} failed:`, error.message);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error(`❌ Session ${sessionId}: OpenRouter API attempt ${attempt} failed:`, errorMessage);
       
       if (attempt === maxRetries) {
         throw error;
@@ -146,6 +167,9 @@ async function callOpenRouterWithRetry(requestBody: any, sessionId: string, maxR
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
+  
+  // This should never be reached, but TypeScript requires a return
+  throw new Error("Max retries exceeded");
 }
 
 // Fallback responses when API is unavailable
@@ -179,7 +203,7 @@ function getFallbackResponse(bookingState: BookingState): string {
 
 export async function POST(req: Request) {
   try {
-    const { messages } = await req.json();
+    const { messages }: { messages: ChatMessage[] } = await req.json();
     
     console.log("🔍 Processing booking request with", messages.length, "messages");
     
@@ -196,12 +220,12 @@ export async function POST(req: Request) {
 
     try {
       // Try to call OpenRouter API with per-session retry logic
-      const systemPrompt = {
+      const systemPrompt: ChatMessage = {
         role: "system",
         content: createSystemPrompt(bookingState),
       };
 
-      const requestBody = {
+      const requestBody: OpenRouterRequestBody = {
         model: "meta-llama/llama-3.3-70b-instruct:free",
         messages: [systemPrompt, ...messages],
         max_tokens: 500, // Reduce token usage
@@ -213,8 +237,9 @@ export async function POST(req: Request) {
       apiCallSuccessful = true;
       
     } catch (apiError) {
+      const errorMessage = apiError instanceof Error ? apiError.message : 'Unknown error';
       console.error(`❌ Session ${sessionId}: OpenRouter API failed after retries, using fallback response`);
-      console.error("Error details:", apiError.message);
+      console.error("Error details:", errorMessage);
       
       // Use fallback response when API fails
       reply = getFallbackResponse(bookingState);
@@ -240,7 +265,7 @@ export async function POST(req: Request) {
       console.log("✅ Booking complete, attempting to send email...");
       
       try {
-        await sendBookingEmail(updatedState, messages);
+        await sendBookingEmail(updatedState);
         emailSent = true;
         console.log("✅ Email sent successfully!");
         
@@ -279,8 +304,8 @@ export async function POST(req: Request) {
   }
 }
 
-function extractBookingState(messages: any[]): BookingState {
-  let state: BookingState = {
+function extractBookingState(messages: ChatMessage[]): BookingState {
+  const state: BookingState = {
     step: 1,
     patientName: '',
     phoneNumber: '',
@@ -409,7 +434,7 @@ function determineCurrentStep(state: BookingState): number {
   return 7;
 }
 
-function updateBookingState(currentState: BookingState, latestMessage: string, allMessages: any[]): BookingState {
+function updateBookingState(currentState: BookingState, latestMessage: string, allMessages: ChatMessage[]): BookingState {
   const content = latestMessage.toLowerCase();
   const newState = { ...currentState };
   
@@ -452,7 +477,7 @@ function addProgressIndicator(reply: string, bookingState: BookingState): string
   return `${reply}\n\n📋 **Booking Progress:** ${progressBar} (${bookingState.step}/7 - ${stepName})`;
 }
 
-async function sendBookingEmail(bookingState: BookingState, messages: any[]) {
+async function sendBookingEmail(bookingState: BookingState) {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
     throw new Error("Email credentials not configured");
   }
